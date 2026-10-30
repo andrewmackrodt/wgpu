@@ -42,6 +42,14 @@ Bottom level categories:
 
 ## Unreleased
 
+### New Features
+
+- Added `Device::create_render_pipeline_async` and `Device::create_compute_pipeline_async`, which map to `createRenderPipelineAsync()`/`createComputePipelineAsync()` on WebGPU. Errors are returned through the future instead of the error scope. On native backends the returned future is already resolved. Resolves `gfx-rs/wgpu#3794`.
+
+  **Breaking for custom backends:** Implementations of `DeviceInterface` must implement `create_render_pipeline_async` and `create_compute_pipeline_async`.
+
+  By Islam Abdymazhit in `gfx-rs/wgpu#10438`.
+
 ## v30.0.1 (2026-08-21)
 
 ### Bug Fixes
