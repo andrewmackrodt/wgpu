@@ -233,6 +233,45 @@ impl Surface {
         )
     }
 
+    /// Sets the pre-transform (`VkSwapchainCreateInfoKHR::preTransform`) of the swapchains created from now on, at the
+    /// next configuration; `None` is the identity, the default. With the surface's `currentTransform`, the
+    /// presentation engine need not rotate the images: the caller renders them rotated. A transform the surface does
+    /// not support (`supportedTransforms`), or more than one bit, fails the configuration.
+    ///
+    /// Returns `false` (nothing set) if the surface is a DXGI surface.
+    pub fn set_pre_transform(&self, transform: Option<vk::SurfaceTransformFlagsKHR>) -> bool {
+        match self
+            .inner
+            .as_any()
+            .downcast_ref::<swapchain::NativeSurface>()
+        {
+            Some(native) => {
+                native.set_pre_transform(transform);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The pre-transform set with [`Self::set_pre_transform`] (`None`: the identity, or a DXGI surface).
+    pub fn pre_transform(&self) -> Option<vk::SurfaceTransformFlagsKHR> {
+        self.inner
+            .as_any()
+            .downcast_ref::<swapchain::NativeSurface>()?
+            .pre_transform()
+    }
+
+    /// The number of suboptimal results (`VK_SUBOPTIMAL_KHR`) of acquires and presents on this surface so far,
+    /// including those treated as success on Android; `None` for a DXGI surface.
+    pub fn suboptimal_count(&self) -> Option<u64> {
+        Some(
+            self.inner
+                .as_any()
+                .downcast_ref::<swapchain::NativeSurface>()?
+                .suboptimal_count(),
+        )
+    }
+
     /// Get the raw Vulkan swapchain associated with this surface.
     ///
     /// Returns [`None`] if the surface is not configured or if the swapchain

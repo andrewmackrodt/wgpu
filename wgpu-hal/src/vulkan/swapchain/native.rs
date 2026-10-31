@@ -2,6 +2,7 @@
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::any::Any;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use ash::{khr, vk};
 use parking_lot::{Mutex, MutexGuard};
@@ -19,6 +20,10 @@ pub(crate) struct NativeSurface {
     raw: vk::SurfaceKHR,
     functor: khr::surface::Instance,
     instance: Arc<InstanceShared>,
+    /// The pre-transform the next swapchain is created with; `None` is the identity.
+    pre_transform: Mutex<Option<vk::SurfaceTransformFlagsKHR>>,
+    /// Suboptimal results of acquires and presents on this surface's swapchains.
+    suboptimal: Arc<AtomicU64>,
     /// Built from the window's `HWND` (Windows only) to answer the display-HDR
     /// query; `None` for non-Win32 surfaces.
     #[cfg(windows)]
@@ -38,6 +43,8 @@ impl NativeSurface {
             raw,
             functor,
             instance: Arc::clone(&instance.shared),
+            pre_transform: Mutex::new(None),
+            suboptimal: Arc::new(AtomicU64::new(0)),
             #[cfg(windows)]
             hdr_source: hwnd.map(|wh| crate::auxil::dxgi::hdr::DxgiHdrSource::new(wh.0)),
         }
@@ -45,6 +52,21 @@ impl NativeSurface {
 
     pub fn as_raw(&self) -> vk::SurfaceKHR {
         self.raw
+    }
+
+    /// Sets the pre-transform of the swapchains created from now on (`None`: the identity).
+    pub fn set_pre_transform(&self, transform: Option<vk::SurfaceTransformFlagsKHR>) {
+        *self.pre_transform.lock() = transform;
+    }
+
+    /// The pre-transform set with [`Self::set_pre_transform`].
+    pub fn pre_transform(&self) -> Option<vk::SurfaceTransformFlagsKHR> {
+        *self.pre_transform.lock()
+    }
+
+    /// The number of suboptimal results of acquires and presents so far.
+    pub fn suboptimal_count(&self) -> u64 {
+        self.suboptimal.load(Ordering::Relaxed)
     }
 }
 
@@ -195,6 +217,31 @@ impl Surface for NativeSurface {
 
         let color_space = conv::map_surface_color_space(config.color_space);
 
+        // The caller's pre-transform, refused when the surface does not support it.
+        let pre_transform = match *self.pre_transform.lock() {
+            None => vk::SurfaceTransformFlagsKHR::IDENTITY,
+            Some(transform) => {
+                let caps = unsafe {
+                    self.functor.get_physical_device_surface_capabilities(
+                        device.shared.physical_device,
+                        self.raw,
+                    )
+                }
+                .map_err(|error| match error {
+                    vk::Result::ERROR_SURFACE_LOST_KHR => crate::SurfaceError::Lost,
+                    other => map_host_device_oom_and_lost_err(other).into(),
+                })?;
+                if transform.as_raw().count_ones() != 1
+                    || !caps.supported_transforms.contains(transform)
+                {
+                    return Err(crate::SurfaceError::Other(
+                        "the requested pre-transform is not supported by the surface",
+                    ));
+                }
+                transform
+            }
+        };
+
         let original_format = device.shared.private_caps.map_texture_format(config.format);
         let mut raw_flags = vk::SwapchainCreateFlagsKHR::empty();
         let mut raw_view_formats: Vec<vk::Format> = vec![];
@@ -221,7 +268,7 @@ impl Surface for NativeSurface {
             .image_array_layers(config.extent.depth_or_array_layers)
             .image_usage(conv::map_texture_usage(config.usage))
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+            .pre_transform(pre_transform)
             .composite_alpha(conv::map_composite_alpha_mode(config.composite_alpha_mode))
             .present_mode(conv::map_present_mode(config.present_mode))
             .clipped(true)
@@ -299,6 +346,7 @@ impl Surface for NativeSurface {
             next_acquire_index: 0,
             present_semaphores,
             next_present_time: None,
+            suboptimal: Arc::clone(&self.suboptimal),
         }))
     }
 
@@ -365,6 +413,8 @@ pub(crate) struct NativeSwapchain {
     /// This must only be set if [`wgt::Features::VULKAN_GOOGLE_DISPLAY_TIMING`] is enabled, and
     /// so the VK_GOOGLE_display_timing extension is present.
     next_present_time: Option<vk::PresentTimeGOOGLE>,
+    /// The surface's count of suboptimal results.
+    suboptimal: Arc<AtomicU64>,
 }
 
 impl Drop for NativeSwapchain {
@@ -479,11 +529,21 @@ impl Swapchain for NativeSwapchain {
             )
         } {
             // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
-            // See the comment in `Queue::present`.
+            // See the comment in `Queue::present`. It is counted either way.
             #[cfg(target_os = "android")]
-            Ok((index, _)) => (index, false),
+            Ok((index, suboptimal)) => {
+                if suboptimal {
+                    self.suboptimal.fetch_add(1, Ordering::Relaxed);
+                }
+                (index, false)
+            }
             #[cfg(not(target_os = "android"))]
-            Ok(pair) => pair,
+            Ok(pair) => {
+                if pair.1 {
+                    self.suboptimal.fetch_add(1, Ordering::Relaxed);
+                }
+                pair
+            }
             Err(error) => {
                 return match error {
                     vk::Result::TIMEOUT => Err(crate::SurfaceError::Timeout),
@@ -623,6 +683,7 @@ impl Swapchain for NativeSwapchain {
             })?
         };
         if suboptimal {
+            self.suboptimal.fetch_add(1, Ordering::Relaxed);
             // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
             // On Android 10+, libvulkan's `vkQueuePresentKHR` implementation returns `VK_SUBOPTIMAL_KHR` if not doing pre-rotation
             // (i.e `VkSwapchainCreateInfoKHR::preTransform` not being equal to the current device orientation).
