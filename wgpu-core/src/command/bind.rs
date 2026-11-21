@@ -226,7 +226,10 @@ mod compat {
                 let (must_set, must_rebind) = match (&mut e.expected, new_expected_bgl) {
                     (None, None) => (false, false),
                     (None, Some(_)) => (true, true),
-                    (Some(_), None) => (true, false),
+                    // A gap in the new layout (`None`) is a different set layout from the old group's (Vulkan's empty
+                    // descriptor set layout), so the groups above it are disturbed and must be sent again
+                    // (gfx-rs/wgpu#10813). The gap itself is never rebound (`is_valid` is false without an expectation).
+                    (Some(_), None) => (true, true),
                     (Some(old_expected_bgl), Some(new_expected_bgl)) => {
                         let is_different = !old_expected_bgl.is_equal(new_expected_bgl);
                         (is_different, is_different)
