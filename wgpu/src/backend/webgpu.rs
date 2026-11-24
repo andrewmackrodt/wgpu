@@ -3420,6 +3420,10 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
             mapped_desc.set_depth_stencil_attachment(&mapped_depth_stencil_attachment);
         }
 
+        if let Some(qs) = desc.occlusion_query_set {
+            mapped_desc.set_occlusion_query_set(&qs.inner.as_webgpu().inner);
+        }
+
         if let Some(ref timestamp_writes) = desc.timestamp_writes {
             let query_set = &timestamp_writes.query_set.inner.as_webgpu().inner;
             let writes = webgpu_sys::GpuRenderPassTimestampWrites::new(query_set);
