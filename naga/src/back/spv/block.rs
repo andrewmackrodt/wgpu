@@ -257,7 +257,13 @@ impl Writer {
                 }
             };
 
-            self.store_io_with_f16_polyfill(body, res_member.id, member_value_id);
+            let pointer_id = self.sample_mask_word(
+                body,
+                spirv::StorageClass::Output,
+                res_member.id,
+                res_member.built_in,
+            );
+            self.store_io_with_f16_polyfill(body, pointer_id, member_value_id);
 
             match res_member.built_in {
                 Some(crate::BuiltIn::Position { .. })
