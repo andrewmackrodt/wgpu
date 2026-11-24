@@ -1409,9 +1409,15 @@ impl Writer {
                         binding,
                     )?;
                     iface.varying_ids.push(varying_id);
+                    let pointer_id = self.sample_mask_word(
+                        &mut prelude.body,
+                        class,
+                        varying_id,
+                        binding.to_built_in(),
+                    );
                     let id = self.load_io_with_f16_polyfill(
                         &mut prelude.body,
-                        varying_id,
+                        pointer_id,
                         argument_type_id,
                     );
                     if binding == &crate::Binding::BuiltIn(crate::BuiltIn::LocalInvocationIndex) {
@@ -1438,8 +1444,14 @@ impl Writer {
                             binding,
                         )?;
                         iface.varying_ids.push(varying_id);
+                        let pointer_id = self.sample_mask_word(
+                            &mut prelude.body,
+                            class,
+                            varying_id,
+                            binding.to_built_in(),
+                        );
                         let id =
-                            self.load_io_with_f16_polyfill(&mut prelude.body, varying_id, type_id);
+                            self.load_io_with_f16_polyfill(&mut prelude.body, pointer_id, type_id);
                         constituent_ids.push(id);
                         if binding == &crate::Binding::BuiltIn(crate::BuiltIn::LocalInvocationIndex)
                         {
@@ -3153,6 +3165,15 @@ impl Writer {
             self.io_f16_polyfills.register_io_var(id, f32_type_id);
 
             ptr_id
+        } else if *binding == crate::Binding::BuiltIn(crate::BuiltIn::SampleMask) {
+            // Vulkan's SampleMask is an array of 32-bit integers (VUID-SampleMask-SampleMask-04359), WGSL's the one
+            // word of it (`sample_mask_word`).
+            let array_type_id = self.id_gen.next();
+            let element_type_id = self.get_handle_type_id(ty);
+            let length_id = self.get_index_constant(1);
+            Instruction::type_array(array_type_id, element_type_id, length_id)
+                .to_words(&mut self.logical_layout.declarations);
+            self.get_pointer_type_id(array_type_id, class)
         } else {
             self.get_handle_pointer_type_id(ty, class)
         };
@@ -3173,6 +3194,31 @@ impl Writer {
         self.write_binding(id, binding);
 
         Ok(id)
+    }
+
+    /// The pointer an entry point loads a varying from, or stores it through: `varying_id` itself, or a `SampleMask`
+    /// array's one word.
+    pub(super) fn sample_mask_word(
+        &mut self,
+        body: &mut Vec<Instruction>,
+        class: spirv::StorageClass,
+        varying_id: Word,
+        built_in: Option<crate::BuiltIn>,
+    ) -> Word {
+        if built_in != Some(crate::BuiltIn::SampleMask) {
+            return varying_id;
+        }
+        let word_type_id = self.get_u32_type_id();
+        let pointer_type_id = self.get_pointer_type_id(word_type_id, class);
+        let index_id = self.get_index_constant(0);
+        let id = self.id_gen.next();
+        body.push(Instruction::access_chain(
+            pointer_type_id,
+            id,
+            varying_id,
+            &[index_id],
+        ));
+        id
     }
 
     pub fn write_binding(&mut self, id: Word, binding: BindingDecorations) {
