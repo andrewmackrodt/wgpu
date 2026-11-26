@@ -32,6 +32,10 @@ struct ImageCoordinates {
     /// The number of components in `value`, if it is a vector, or `None` if it
     /// is a scalar.
     size: Option<crate::VectorSize>,
+
+    /// The scalar type of `value`'s components (`i32` or `u32` for image loads
+    /// and stores, `f32` for samples).
+    scalar: crate::Scalar,
 }
 
 /// A trait for image access (load or store) code generators.
@@ -274,15 +278,16 @@ impl BlockContext<'_> {
             None => {
                 let value_id = coordinates_id;
                 let type_id = self.get_expression_type_id(ty);
-                let size = match *inner_ty {
-                    Ti::Scalar { .. } => None,
-                    Ti::Vector { size, .. } => Some(size),
+                let (size, scalar) = match *inner_ty {
+                    Ti::Scalar(scalar) => (None, scalar),
+                    Ti::Vector { size, scalar } => (Some(size), scalar),
                     _ => return Err(Error::Validation("coordinate type")),
                 };
                 return Ok(ImageCoordinates {
                     value_id,
                     type_id,
                     size,
+                    scalar,
                 });
             }
             Some(ix) => ix,
@@ -369,6 +374,7 @@ impl BlockContext<'_> {
             value_id,
             type_id,
             size: Some(size),
+            scalar: component_scalar,
         })
     }
 
@@ -399,9 +405,13 @@ impl BlockContext<'_> {
     /// Generate a vector or scalar 'one' for arithmetic on `coordinates`.
     ///
     /// If `coordinates` is a scalar, return a scalar one. Otherwise, return
-    /// a vector of ones.
+    /// a vector of ones. The ones have the coordinates' own component type:
+    /// a vector constant's constituents must all be of its component type, so
+    /// `u32` coordinates need `1u`, not `1i`.
     fn write_coordinate_one(&mut self, coordinates: &ImageCoordinates) -> Result<Word, Error> {
-        let one = self.get_scope_constant(1);
+        let one = self
+            .writer
+            .get_constant_scalar_with(1, coordinates.scalar)?;
         match coordinates.size {
             None => Ok(one),
             Some(vector_size) => {
