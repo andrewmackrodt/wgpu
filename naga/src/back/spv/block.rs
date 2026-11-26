@@ -2,15 +2,15 @@
 Implementations for `BlockContext` methods.
 */
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use arrayvec::ArrayVec;
 use spirv::Word;
 
 use super::{
     helpers::map_storage_class, index::BoundsCheckResult, selection::Selection, Block,
-    BlockContext, Dimension, Error, IdGenerator, Instruction, LocalType, LookupType, NumericType,
-    ResultMember, WrappedFunction, Writer, WriterFlags,
+    BlockContext, Dimension, Error, IdGenerator, Instruction, LayoutComposite, LocalType,
+    LookupType, NumericType, ResultMember, WrappedFunction, Writer, WriterFlags,
 };
 use crate::{
     arena::Handle, back::spv::helpers::is_uniform_matcx2_struct_member_access,
@@ -2807,12 +2807,25 @@ impl BlockContext<'_> {
                 };
             };
 
+            // A pointer to a copy of the type without explicit layout loads
+            // the copy, converted to the value's type below.
+            let layout_free_load = match wrapped_load {
+                Some(_) => None,
+                None => self.layout_free_pointee(pointer, access_type_adjustment),
+            };
+
             let (load_type_id, access_type_adjustment) = match wrapped_load {
                 Some(ref wrapped_load) => (
                     self.writer.std140_compat_uniform_types[&wrapped_load.r#type].type_id,
                     wrapped_load.access_type_adjustment,
                 ),
-                None => (result_type_id, access_type_adjustment),
+                None => match layout_free_load {
+                    Some(ty) => (
+                        self.writer.get_layout_free_type_id(ty),
+                        access_type_adjustment,
+                    ),
+                    None => (result_type_id, access_type_adjustment),
+                },
             };
 
             let load_id = match self.write_access_chain(pointer, block, access_type_adjustment)? {
@@ -2885,9 +2898,94 @@ impl BlockContext<'_> {
                     ));
                     Ok(result_id)
                 }
-                None => Ok(load_id),
+                None => match layout_free_load {
+                    Some(ty) => Ok(self.write_layout_copy(ty, load_id, false, block)),
+                    None => Ok(load_id),
+                },
             }
         }
+    }
+
+    /// If loading or storing through `pointer` (adjusted by `adjustment`)
+    /// reaches a copy of a type without explicit layout, return the type.
+    ///
+    /// See [`Writer::needs_layout_free_type`].
+    fn layout_free_pointee(
+        &self,
+        pointer: Handle<crate::Expression>,
+        adjustment: AccessTypeAdjustment,
+    ) -> Option<Handle<crate::Type>> {
+        let resolution = &self.fun_info[pointer].ty;
+        let (ty, class) = match adjustment {
+            AccessTypeAdjustment::None => match *resolution.inner_with(&self.ir_module.types) {
+                crate::TypeInner::Pointer { base, space } => (base, map_storage_class(space)),
+                _ => return None,
+            },
+            AccessTypeAdjustment::IntroducePointer(class) => match *resolution {
+                crate::proc::TypeResolution::Handle(ty) => (ty, class),
+                crate::proc::TypeResolution::Value(_) => return None,
+            },
+            AccessTypeAdjustment::UseStd140CompatType => return None,
+        };
+        self.writer.needs_layout_free_type(ty, class).then_some(ty)
+    }
+
+    /// Convert `value_id`, a value of `ty`, between `ty` and its copy without
+    /// explicit layout (to the copy if `to_layout_free`, else from it).
+    ///
+    /// From SPIR-V 1.4 this is one `OpCopyLogical`; before, the composite is
+    /// taken apart and built again, converting the components that have
+    /// copies of their own.
+    pub(super) fn write_layout_copy(
+        &mut self,
+        ty: Handle<crate::Type>,
+        value_id: Word,
+        to_layout_free: bool,
+        block: &mut Block,
+    ) -> Word {
+        let result_type_id = if to_layout_free {
+            self.writer.get_layout_free_type_id(ty)
+        } else {
+            self.get_handle_type_id(ty)
+        };
+        let id = self.gen_id();
+        if self.writer.physical_layout.version >= 0x10400 {
+            block
+                .body
+                .push(Instruction::copy_logical(result_type_id, id, value_id));
+            return id;
+        }
+        let components: Vec<Handle<crate::Type>> = match self.writer.layout_composites[&ty] {
+            LayoutComposite::Struct { ref members } => members.clone(),
+            LayoutComposite::Array { base, length } => vec![base; length as usize],
+        };
+        let mut component_ids = Vec::with_capacity(components.len());
+        for (index, component) in components.into_iter().enumerate() {
+            let has_copy = self.writer.layout_composites.contains_key(&component);
+            let component_type_id = if has_copy && !to_layout_free {
+                self.writer.get_layout_free_type_id(component)
+            } else {
+                self.get_handle_type_id(component)
+            };
+            let extracted_id = self.gen_id();
+            block.body.push(Instruction::composite_extract(
+                component_type_id,
+                extracted_id,
+                value_id,
+                &[index as Word],
+            ));
+            component_ids.push(if has_copy {
+                self.write_layout_copy(component, extracted_id, to_layout_free, block)
+            } else {
+                extracted_id
+            });
+        }
+        block.body.push(Instruction::composite_construct(
+            result_type_id,
+            id,
+            &component_ids,
+        ));
+        id
     }
 
     fn spill_to_internal_variable(&mut self, base: Handle<crate::Expression>, block: &mut Block) {
@@ -2941,7 +3039,15 @@ impl BlockContext<'_> {
         // variable for `a` has already been declared, but it is still essential
         // that we store `a` into it, so that `a[z]` sees this iteration's value
         // of `a`.
-        let base_id = self.cached[base];
+        let mut base_id = self.cached[base];
+        if let crate::proc::TypeResolution::Handle(ty) = self.fun_info[base].ty {
+            if self
+                .writer
+                .needs_layout_free_type(ty, spirv::StorageClass::Function)
+            {
+                base_id = self.write_layout_copy(ty, base_id, true, block);
+            }
+        }
         block
             .body
             .push(Instruction::store(spill_variable_id, base_id, None));
@@ -3778,7 +3884,11 @@ impl BlockContext<'_> {
                     self.writer.write_memory_barrier(flags, &mut block);
                 }
                 Statement::Store { pointer, value } => {
-                    let value_id = self.cached[value];
+                    let mut value_id = self.cached[value];
+                    if let Some(ty) = self.layout_free_pointee(pointer, AccessTypeAdjustment::None)
+                    {
+                        value_id = self.write_layout_copy(ty, value_id, true, &mut block);
+                    }
                     match self.write_access_chain(
                         pointer,
                         &mut block,

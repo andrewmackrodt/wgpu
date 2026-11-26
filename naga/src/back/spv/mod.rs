@@ -578,6 +578,21 @@ impl From<LocalType> for LookupType {
     }
 }
 
+/// A struct or fixed-size array type with explicit layout decorations, as the
+/// components of its copy without them.
+///
+/// See [`Writer::layout_composites`].
+#[derive(Debug)]
+enum LayoutComposite {
+    Struct {
+        members: Vec<Handle<crate::Type>>,
+    },
+    Array {
+        base: Handle<crate::Type>,
+        length: u32,
+    },
+}
+
 #[derive(Debug, PartialEq, Clone, Hash, Eq)]
 struct LookupFunctionType {
     parameter_type_ids: Vec<Word>,
@@ -964,6 +979,18 @@ pub struct Writer {
     /// Types that need explicit layout decorations: those reachable from
     /// variables in address spaces backed by buffer memory.
     explicit_layout_types: crate::arena::HandleSet<crate::Type>,
+    /// The structs and fixed-size arrays that are among
+    /// [`explicit_layout_types`] or contain one, with what a copy of them
+    /// without explicit layout is made of.
+    ///
+    /// [`explicit_layout_types`]: Writer::explicit_layout_types
+    layout_composites: crate::FastHashMap<Handle<crate::Type>, LayoutComposite>,
+    /// Copies without explicit layout of [`layout_composites`] types, written
+    /// when a variable in memory that must not be explicitly laid out holds
+    /// one; see [`Writer::get_handle_type_id_in`].
+    ///
+    /// [`layout_composites`]: Writer::layout_composites
+    layout_free_types: crate::FastHashMap<Handle<crate::Type>, Word>,
     fake_missing_bindings: bool,
     binding_map: BindingMap,
 

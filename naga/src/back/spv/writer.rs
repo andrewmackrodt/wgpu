@@ -9,9 +9,9 @@ use super::{
     helpers::{contains_builtin, global_needs_wrapper, map_storage_class},
     Block, BlockContext, CachedConstant, CachedExpressions, CooperativeType, DebugInfo,
     EntryPointContext, Error, Function, FunctionArgument, GlobalVariable, IdGenerator, Instruction,
-    LocalImageType, LocalType, LocalVariable, LogicalLayout, LookupFunctionType, LookupType,
-    NumericType, Options, PhysicalLayout, PipelineOptions, ResultMember, Writer, WriterFlags,
-    BITS_PER_BYTE,
+    LayoutComposite, LocalImageType, LocalType, LocalVariable, LogicalLayout, LookupFunctionType,
+    LookupType, NumericType, Options, PhysicalLayout, PipelineOptions, ResultMember, Writer,
+    WriterFlags, BITS_PER_BYTE,
 };
 use crate::{
     arena::{Handle, HandleVec, UniqueArena},
@@ -108,6 +108,8 @@ impl Writer {
             global_variables: HandleVec::new(),
             std140_compat_uniform_types: crate::FastHashMap::default(),
             explicit_layout_types: crate::arena::HandleSet::new(),
+            layout_composites: crate::FastHashMap::default(),
+            layout_free_types: crate::FastHashMap::default(),
             fake_missing_bindings: options.fake_missing_bindings,
             binding_map: options.binding_map.clone(),
             saved_cached: CachedExpressions::default(),
@@ -208,6 +210,8 @@ impl Writer {
             global_variables: take(&mut self.global_variables).reclaim(),
             std140_compat_uniform_types: take(&mut self.std140_compat_uniform_types).reclaim(),
             explicit_layout_types: crate::arena::HandleSet::new(),
+            layout_composites: take(&mut self.layout_composites).reclaim(),
+            layout_free_types: take(&mut self.layout_free_types).reclaim(),
             saved_cached: take(&mut self.saved_cached).reclaim(),
             temp_list: take(&mut self.temp_list).reclaim(),
             ray_query_functions: take(&mut self.ray_query_functions).reclaim(),
@@ -330,6 +334,95 @@ impl Writer {
         self.get_type_id(LookupType::Handle(handle))
     }
 
+    /// Whether a variable in storage class `class` holding a `handle` must use
+    /// a copy of the type without explicit layout decorations.
+    ///
+    /// Explicit layout is written on the types reachable from buffer
+    /// variables. A struct or array with explicit layout anywhere inside it
+    /// that is also held in `Workgroup` memory, or (from SPIR-V 1.4) in
+    /// `Function` or `Private` memory, needs a second SPIR-V type without it
+    /// there (`VUID-StandaloneSpirv-None-10684`). Values of the type keep the
+    /// laid-out type; loads and stores through pointers to the copy convert
+    /// them (see `BlockContext::write_layout_copy`).
+    pub(super) fn needs_layout_free_type(
+        &self,
+        handle: Handle<crate::Type>,
+        class: spirv::StorageClass,
+    ) -> bool {
+        let applies = match class {
+            spirv::StorageClass::Workgroup => true,
+            spirv::StorageClass::Function | spirv::StorageClass::Private => {
+                self.physical_layout.version >= 0x10400
+            }
+            _ => false,
+        };
+        applies && self.layout_composites.contains_key(&handle)
+    }
+
+    /// The type id for a `handle` held by a variable in storage class `class`.
+    ///
+    /// This is the copy of the type without explicit layout when
+    /// [`needs_layout_free_type`] says so, otherwise the type itself.
+    ///
+    /// [`needs_layout_free_type`]: Writer::needs_layout_free_type
+    pub(super) fn get_handle_type_id_in(
+        &mut self,
+        handle: Handle<crate::Type>,
+        class: spirv::StorageClass,
+    ) -> Word {
+        if self.needs_layout_free_type(handle, class) {
+            self.get_layout_free_type_id(handle)
+        } else {
+            self.get_handle_type_id(handle)
+        }
+    }
+
+    /// The id of a copy of `handle`, a [`layout_composites`] type, without
+    /// explicit layout decorations, written the first time it is asked for.
+    ///
+    /// Its components are the copies of theirs, if they have one.
+    ///
+    /// [`layout_composites`]: Writer::layout_composites
+    pub(super) fn get_layout_free_type_id(&mut self, handle: Handle<crate::Type>) -> Word {
+        if let Some(&id) = self.layout_free_types.get(&handle) {
+            return id;
+        }
+        let instruction = match self.layout_composites[&handle] {
+            LayoutComposite::Struct { ref members } => {
+                let members = members.clone();
+                let member_ids: Vec<Word> = members
+                    .into_iter()
+                    .map(|member| self.get_layout_free_component_type_id(member))
+                    .collect();
+                let id = self.id_gen.next();
+                Instruction::type_struct(id, &member_ids)
+            }
+            LayoutComposite::Array { base, length } => {
+                let base_id = self.get_layout_free_component_type_id(base);
+                let length_id = self.get_index_constant(length);
+                let id = self.id_gen.next();
+                Instruction::type_array(id, base_id, length_id)
+            }
+        };
+        let id = instruction.result_id.unwrap();
+        instruction.to_words(&mut self.logical_layout.declarations);
+        self.layout_free_types.insert(handle, id);
+        id
+    }
+
+    /// The type id of a component of a copy without explicit layout: the
+    /// component's own copy if it has explicit layout, else the type itself.
+    pub(super) fn get_layout_free_component_type_id(
+        &mut self,
+        handle: Handle<crate::Type>,
+    ) -> Word {
+        if self.layout_composites.contains_key(&handle) {
+            self.get_layout_free_type_id(handle)
+        } else {
+            self.get_handle_type_id(handle)
+        }
+    }
+
     pub(super) fn get_expression_lookup_type(&mut self, tr: &TypeResolution) -> LookupType {
         match *tr {
             TypeResolution::Handle(ty_handle) => LookupType::Handle(ty_handle),
@@ -358,7 +451,7 @@ impl Writer {
         base: Handle<crate::Type>,
         class: spirv::StorageClass,
     ) -> Word {
-        let base_id = self.get_handle_type_id(base);
+        let base_id = self.get_handle_type_id_in(base, class);
         self.get_pointer_type_id(base_id, class)
     }
 
@@ -376,7 +469,10 @@ impl Writer {
         resolution: &TypeResolution,
         class: spirv::StorageClass,
     ) -> Word {
-        let resolution_type_id = self.get_expression_type_id(resolution);
+        let resolution_type_id = match *resolution {
+            TypeResolution::Handle(handle) => self.get_handle_type_id_in(handle, class),
+            TypeResolution::Value(_) => self.get_expression_type_id(resolution),
+        };
         self.get_pointer_type_id(resolution_type_id, class)
     }
 
@@ -487,10 +583,11 @@ impl Writer {
                 LocalType::Cooperative(CooperativeType::from_inner(inner).unwrap())
             }
             crate::TypeInner::Pointer { base, space } => {
-                let base_type_id = self.get_handle_type_id(base);
+                let class = map_storage_class(space);
+                let base_type_id = self.get_handle_type_id_in(base, class);
                 LocalType::Pointer {
                     base: base_type_id,
-                    class: map_storage_class(space),
+                    class,
                 }
             }
             crate::TypeInner::ValuePointer {
@@ -1624,10 +1721,22 @@ impl Writer {
                 }
             }
 
-            let init_word = variable.init.map(|constant| context.cached[constant]);
+            let mut init_word = variable.init.map(|constant| context.cached[constant]);
             let pointer_type_id = context
                 .writer
                 .get_handle_pointer_type_id(variable.ty, spirv::StorageClass::Function);
+            if context
+                .writer
+                .needs_layout_free_type(variable.ty, spirv::StorageClass::Function)
+            {
+                // The initializer is a value of the laid-out type: store its
+                // copy in the prelude, after the variables.
+                if let Some(value_id) = init_word.take() {
+                    let copy_id =
+                        context.write_layout_copy(variable.ty, value_id, true, &mut prelude);
+                    prelude.body.push(Instruction::store(id, copy_id, None));
+                }
+            }
             let instruction = Instruction::variable(
                 pointer_type_id,
                 id,
@@ -1635,7 +1744,9 @@ impl Writer {
                 init_word.or_else(|| match ir_module.types[variable.ty].inner {
                     crate::TypeInner::RayQuery { .. } => None,
                     _ => {
-                        let type_id = context.get_handle_type_id(variable.ty);
+                        let type_id = context
+                            .writer
+                            .get_handle_type_id_in(variable.ty, spirv::StorageClass::Function);
                         Some(context.writer.write_constant_null(type_id))
                     }
                 }),
@@ -2784,6 +2895,49 @@ impl Writer {
         Ok(id)
     }
 
+    /// Write the const-expression `handle`, of type `ty`, as a constant of
+    /// `ty`'s copy without explicit layout (see [`get_layout_free_type_id`]).
+    ///
+    /// [`get_layout_free_type_id`]: Writer::get_layout_free_type_id
+    fn write_layout_free_constant(
+        &mut self,
+        ir_module: &crate::Module,
+        handle: Handle<crate::Expression>,
+        ty: Handle<crate::Type>,
+    ) -> Result<Word, Error> {
+        if !self.layout_composites.contains_key(&ty) {
+            return Ok(self.constant_ids[handle]);
+        }
+        let type_id = self.get_layout_free_type_id(ty);
+        match ir_module.global_expressions[handle] {
+            crate::Expression::Constant(constant) => {
+                self.write_layout_free_constant(ir_module, ir_module.constants[constant].init, ty)
+            }
+            crate::Expression::ZeroValue(_) => Ok(self.get_constant_null(type_id)),
+            crate::Expression::Compose { ref components, .. } => {
+                let mut component_ids = Vec::with_capacity(components.len());
+                for (index, &component) in components.iter().enumerate() {
+                    let component_ty = match self.layout_composites[&ty] {
+                        LayoutComposite::Struct { ref members } => members[index],
+                        LayoutComposite::Array { base, .. } => base,
+                    };
+                    component_ids.push(self.write_layout_free_constant(
+                        ir_module,
+                        component,
+                        component_ty,
+                    )?);
+                }
+                let id = self.id_gen.next();
+                Instruction::constant_composite(type_id, id, &component_ids)
+                    .to_words(&mut self.logical_layout.declarations);
+                Ok(id)
+            }
+            _ => Err(Error::Validation(
+                "unexpected const-expression for a struct or array initializer",
+            )),
+        }
+    }
+
     pub(super) fn write_control_barrier(
         &mut self,
         flags: crate::Barrier,
@@ -2881,7 +3035,7 @@ impl Writer {
                 // variables in the `Uniform` and `StorageBuffer` address spaces
                 // get wrapped, and we're initializing `WorkGroup` variables.
                 let var_id = self.global_variables[handle].var_id;
-                let var_type_id = self.get_handle_type_id(var.ty);
+                let var_type_id = self.get_handle_type_id_in(var.ty, map_storage_class(var.space));
                 let init_word = self.get_constant_null(var_type_id);
                 Instruction::store(var_id, init_word, None)
             })
@@ -3490,12 +3644,17 @@ impl Writer {
             }
         };
 
-        let init_word = global_variable
-            .init
-            .map(|constant| self.constant_ids[constant]);
-        let inner_type_id = self.get_type_id(
-            substitute_inner_type_lookup.unwrap_or(LookupType::Handle(global_variable.ty)),
-        );
+        let inner_type_id = match substitute_inner_type_lookup {
+            Some(lookup) => self.get_type_id(lookup),
+            None => self.get_handle_type_id_in(global_variable.ty, class),
+        };
+        let init_word = match global_variable.init {
+            Some(init) if self.needs_layout_free_type(global_variable.ty, class) => {
+                Some(self.write_layout_free_constant(ir_module, init, global_variable.ty)?)
+            }
+            Some(init) => Some(self.constant_ids[init]),
+            None => None,
+        };
 
         // generate the wrapping structure if needed
         let pointer_type_id = if global_needs_wrapper(ir_module, global_variable) {
@@ -3775,6 +3934,37 @@ impl Writer {
         }
 
         self.explicit_layout_types = explicit_layout_types(ir_module);
+        // The structs and fixed-size arrays written with explicit layout
+        // somewhere inside them. The arena lists a type's components before it.
+        self.layout_composites.clear();
+        for (handle, ty) in ir_module.types.iter() {
+            let composite = match ty.inner {
+                crate::TypeInner::Struct { ref members, .. } => LayoutComposite::Struct {
+                    members: members.iter().map(|member| member.ty).collect(),
+                },
+                crate::TypeInner::Array { base, size, .. } => {
+                    match size.resolve(ir_module.to_ctx())? {
+                        crate::proc::IndexableLength::Known(length) => {
+                            LayoutComposite::Array { base, length }
+                        }
+                        crate::proc::IndexableLength::Dynamic => continue,
+                    }
+                }
+                _ => continue,
+            };
+            let laid_out = self.explicit_layout_types.contains(handle)
+                || match composite {
+                    LayoutComposite::Struct { ref members } => members
+                        .iter()
+                        .any(|member| self.layout_composites.contains_key(member)),
+                    LayoutComposite::Array { base, .. } => {
+                        self.layout_composites.contains_key(&base)
+                    }
+                };
+            if laid_out {
+                self.layout_composites.insert(handle, composite);
+            }
+        }
 
         // write all types
         for (handle, _) in ir_module.types.iter() {
