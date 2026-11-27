@@ -782,6 +782,7 @@ impl super::Device {
                     naga::back::spv::write_vec(&module, &info, options, Some(&pipeline_options))
                 }
                 .map_err(|e| crate::PipelineError::Linkage(stage_flags, format!("{e}")))?;
+                super::spirv_tap::tap(naga_stage, stage.entry_point, &spv);
                 self.create_shader_module_impl(&spv, &None)?
             }
         };

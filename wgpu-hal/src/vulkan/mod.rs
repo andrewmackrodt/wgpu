@@ -33,9 +33,11 @@ mod drm;
 mod instance;
 mod sampler;
 mod semaphore_list;
+mod spirv_tap;
 mod swapchain;
 
 pub use adapter::PhysicalDeviceFeatures;
+pub use spirv_tap::{with_spirv_tap, SpirvTap};
 
 use alloc::{boxed::Box, ffi::CString, sync::Arc, vec::Vec};
 use core::{borrow::Borrow, ffi::CStr, fmt, marker::PhantomData, mem, num::NonZeroU32};
