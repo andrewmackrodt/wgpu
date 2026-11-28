@@ -2173,7 +2173,9 @@ impl crate::Device for super::Device {
                 self.shared
                     .raw
                     .create_graphics_pipelines(pipeline_cache, &vk_infos, None)
-                    .map_err(|(_, e)| super::map_pipeline_err(e))
+                    .map_err(|(_, e)| {
+                        super::map_pipeline_err(e, wgt::ShaderStages::VERTEX_FRAGMENT)
+                    })
             }?
         };
 
@@ -2256,7 +2258,7 @@ impl crate::Device for super::Device {
                 self.shared
                     .raw
                     .create_compute_pipelines(pipeline_cache, &vk_infos, None)
-                    .map_err(|(_, e)| super::map_pipeline_err(e))
+                    .map_err(|(_, e)| super::map_pipeline_err(e, wgt::ShaderStages::COMPUTE))
             }?
         };
 
@@ -2395,7 +2397,7 @@ impl crate::Device for super::Device {
                 &create_infos,
                 None,
             )
-            .map_err(|(_, e)| super::map_pipeline_err(e))
+            .map_err(|(_, e)| super::map_pipeline_err(e, wgt::ShaderStages::empty()))
         }?;
 
         if let Some(raw_module) = compiled_ray_gen.temp_raw_module {

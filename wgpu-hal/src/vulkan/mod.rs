@@ -1697,12 +1697,29 @@ fn map_host_oom_and_ioca_err(err: vk::Result) -> crate::DeviceError {
 /// - VK_ERROR_OUT_OF_DEVICE_MEMORY
 /// - VK_PIPELINE_COMPILE_REQUIRED_EXT
 /// - VK_ERROR_INVALID_SHADER_NV
-fn map_pipeline_err(err: vk::Result) -> crate::DeviceError {
-    // We don't use VK_EXT_pipeline_creation_cache_control
-    // VK_PIPELINE_COMPILE_REQUIRED_EXT
-    // We don't use VK_NV_glsl_shader
-    // VK_ERROR_INVALID_SHADER_NV
-    map_host_device_oom_err(err)
+/// Maps the result of a `vkCreate*Pipelines` call for the pipeline of `stages`.
+///
+/// - VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_OUT_OF_DEVICE_MEMORY: the device's out of memory
+/// - VK_ERROR_DEVICE_LOST: the device's loss
+/// - any other result: this pipeline failed ([`crate::PipelineError::Linkage`]), the device is kept
+///
+/// The specification allows only the memory errors here (we don't use VK_EXT_pipeline_creation_cache_control's
+/// VK_PIPELINE_COMPILE_REQUIRED_EXT or VK_NV_glsl_shader's VK_ERROR_INVALID_SHADER_NV), but a driver whose shader compiler
+/// fails on a valid module can return another code: the Adreno 830's (driver build 0603ba43d2, compiler E031.47.18.56)
+/// logs "Failed to link shaders" and returns an unmapped result for one render pipeline of an otherwise working
+/// application. Mapped to an unexpected device error, that one pipeline lost the whole device; as a linkage error only
+/// the pipeline fails, which the application can report and replace.
+fn map_pipeline_err(err: vk::Result, stages: wgt::ShaderStages) -> crate::PipelineError {
+    match err {
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
+            crate::PipelineError::Device(get_oom_err(err))
+        }
+        vk::Result::ERROR_DEVICE_LOST => crate::PipelineError::Device(get_lost_err()),
+        e => crate::PipelineError::Linkage(
+            stages,
+            format!("the driver refused the pipeline ({e:?})"),
+        ),
+    }
 }
 
 /// Returns [`crate::DeviceError::Unexpected`] or panics if the `internal_error_panic`
@@ -1802,3 +1819,32 @@ where
 /// - Callback must not change anything to what the instance does not support.
 pub type CreateInstanceCallback<'this> =
     dyn for<'arg, 'pnext> FnOnce(CreateInstanceCallbackArgs<'arg, 'pnext, 'this>) + 'this;
+
+#[cfg(test)]
+mod pipeline_err_tests {
+    use super::*;
+
+    /// A driver's unmapped result for one pipeline fails that pipeline, not the device; memory errors and a lost device
+    /// stay the device's.
+    #[test]
+    fn an_unmapped_pipeline_result_fails_the_pipeline_not_the_device() {
+        let stages = wgt::ShaderStages::VERTEX_FRAGMENT;
+        assert!(matches!(
+            map_pipeline_err(vk::Result::ERROR_UNKNOWN, stages),
+            crate::PipelineError::Linkage(s, _) if s == stages
+        ));
+        assert!(matches!(
+            map_pipeline_err(vk::Result::ERROR_INITIALIZATION_FAILED, wgt::ShaderStages::COMPUTE),
+            crate::PipelineError::Linkage(s, _) if s == wgt::ShaderStages::COMPUTE
+        ));
+        assert!(matches!(
+            map_pipeline_err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY, stages),
+            crate::PipelineError::Device(crate::DeviceError::OutOfMemory)
+        ));
+        #[cfg(not(feature = "device_lost_panic"))]
+        assert!(matches!(
+            map_pipeline_err(vk::Result::ERROR_DEVICE_LOST, stages),
+            crate::PipelineError::Device(crate::DeviceError::Lost)
+        ));
+    }
+}
